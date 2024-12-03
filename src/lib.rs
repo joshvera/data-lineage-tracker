@@ -365,9 +365,8 @@ mod tests {
         write(&temp_file, source_code)?;
 
         let mut tracker = DataLineageTracker::new();
-        tracker.analyze_file(temp_file.path())?;
-
-        let lineage = tracker.get_full_lineage("globalVar");
+        let analyzed_tracker = tracker.analyze_file(temp_file.path())?;
+        let lineage = analyzed_tracker.get_full_lineage("globalVar");
         assert!(lineage.contains(&"Declared in scope: global".to_string()));
 
         Ok(())
