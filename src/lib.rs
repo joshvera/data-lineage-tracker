@@ -5,41 +5,22 @@ use tree_sitter_graph::graph::Value;
 use tree_sitter_graph::graph::{Graph, GraphNodeRef};
 use tree_sitter_graph::Identifier;
 
-#[derive(Debug, Clone)]
-struct Declaration {
-    pub name: String,
-    pub location: Location,
-    pub scope: String,
-    pub references: Vec<Reference>,
-}
-
-#[derive(Debug, Clone)]
-struct Reference {
-    pub location: Location,
-    pub context: String,
-}
-
-#[derive(Debug, Clone)]
-struct Location {
-    pub line: usize,
-    pub column: usize,
-    pub length: usize,
-}
-
-pub struct DataLineageTracker {
-    declarations: HashMap<String, Declaration>,
+pub struct DataLineageTracker<'tree> {
+    graph: Graph<'tree>,
+    tree: Option<tree_sitter::Tree>,
     source_code: String,
 }
 
-impl DataLineageTracker {
+impl<'tree> DataLineageTracker<'tree> {
     pub fn new() -> Self {
         Self {
-            declarations: HashMap::new(),
+            graph: Graph::new(),
+            tree: None,
             source_code: String::new(),
         }
     }
 
-    pub fn analyze_file<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn Error>> {
+    pub fn analyze_file<P: AsRef<Path>>(&'tree mut self, path: P) -> Result<&'tree Self, Box<dyn Error>> {
         self.source_code = std::fs::read_to_string(path)?;
 
         let mut parser = tree_sitter::Parser::new();
@@ -47,63 +28,84 @@ impl DataLineageTracker {
             .set_language(tree_sitter_javascript::language())
             .map_err(|e| Box::new(e) as Box<dyn Error>)?;
 
-        let tree = parser
+        // Store the tree in the struct
+        self.tree = Some(parser
             .parse(&self.source_code, None)
-            .ok_or("Failed to parse source code")?;
+            .ok_or("Failed to parse source code")?);
 
-        let mut graph = Graph::new();
-        let root_node = graph.add_graph_node();
-        let root_node_mut = &mut graph[root_node];
+        // Create a new graph
+        let mut new_graph = Graph::new();
+        let root_node = new_graph.add_graph_node();
+        let root_node_mut = &mut new_graph[root_node];
         root_node_mut
             .attributes
             .add(Identifier::from("type"), Value::from("root"))
             .ok();
 
-        // Start traversal with the root node
-        self.traverse_tree(tree.root_node(), &mut graph, &root_node)?;
+        // Get the root node from the stored tree
+        if let Some(tree) = &self.tree {
+            let root_node_ref = tree.root_node();
+            
+            // Process the tree with the new graph
+            self.process_tree(root_node_ref, &mut new_graph, &root_node)?;
 
-        println!("Generated Graph:");
-        println!("{}", graph.pretty_print());
+            // After processing is complete, assign the new graph
+            self.graph = new_graph;
 
-        Ok(())
+            println!("Generated Graph:");
+            println!("{}", self.graph.pretty_print());
+        }
+
+        Ok(self)
     }
 
-    fn traverse_tree<'a>(
-        &mut self,
+    fn process_tree<'a>(
+        &self,
         node: tree_sitter::Node<'a>,
         graph: &mut Graph<'a>,
         parent_ref: &GraphNodeRef,
     ) -> Result<(), Box<dyn Error>> {
+        // Create scope node if this is a scope-defining node
+        let current_scope_ref = match node.kind() {
+            "function_declaration" | "method_definition" | "class_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    if let Ok(name) = name_node.utf8_text(self.source_code.as_bytes()) {
+                        let scope_node = graph.add_graph_node();
+                        let parent_node = &mut graph[*parent_ref];
+                        parent_node.add_edge(scope_node).ok();
+
+                        let scope_node_mut = &mut graph[scope_node];
+                        scope_node_mut
+                            .attributes
+                            .add(Identifier::from("type"), Value::from("scope"))
+                            .ok();
+                        scope_node_mut
+                            .attributes
+                            .add(Identifier::from("name"), Value::from(name))
+                            .ok();
+                        
+                        scope_node
+                    } else {
+                        *parent_ref
+                    }
+                } else {
+                    *parent_ref
+                }
+            }
+            _ => *parent_ref
+        };
+
+        // Process variable declarations and references
         match node.kind() {
             "variable_declarator" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     if let Ok(name) = name_node.utf8_text(self.source_code.as_bytes()) {
                         let scope = self.determine_scope(&node);
-                        
-                        // Store the declaration in the HashMap
                         let start_pos = name_node.start_position();
-                        self.declarations.insert(
-                            name.to_string(),
-                            Declaration {
-                                name: name.to_string(),
-                                location: Location {
-                                    line: start_pos.row + 1,
-                                    column: start_pos.column + 1,
-                                    length: name_node.end_byte() - name_node.start_byte(),
-                                },
-                                scope: scope.clone(),
-                                references: Vec::new(),
-                            },
-                        );
-
-                        // Create graph nodes as before
-                        let _syntax_ref = graph.add_syntax_node(name_node);
+                        
                         let decl_node = graph.add_graph_node();
-
-                        let parent_node = &mut graph[*parent_ref];
-                        if let Err(_) = parent_node.add_edge(decl_node) {
-                            // Edge already exists, we can continue
-                        }
+                        let parent_node = &mut graph[current_scope_ref];
+                        parent_node.add_edge(decl_node).ok();
 
                         let decl_node_mut = &mut graph[decl_node];
                         decl_node_mut
@@ -118,6 +120,13 @@ impl DataLineageTracker {
                             .attributes
                             .add(Identifier::from("scope"), Value::from(scope))
                             .ok();
+                        decl_node_mut
+                            .attributes
+                            .add(
+                                Identifier::from("position"),
+                                Value::from(format!("{},{}", start_pos.row + 1, start_pos.column + 1))
+                            )
+                            .ok();
                     }
                 }
             }
@@ -126,26 +135,9 @@ impl DataLineageTracker {
                     let scope = self.determine_scope(&node);
                     let start_pos = node.start_position();
 
-                    // Update references in the HashMap
-                    if let Some(decl) = self.declarations.get_mut(&name.to_string()) {
-                        decl.references.push(Reference {
-                            location: Location {
-                                line: start_pos.row + 1,
-                                column: start_pos.column + 1,
-                                length: node.end_byte() - node.start_byte(),
-                            },
-                            context: scope.clone(),
-                        });
-                    }
-
-                    // Create graph nodes as before
-                    let _syntax_ref = graph.add_syntax_node(node);
                     let ref_node = graph.add_graph_node();
-
-                    let parent_node = &mut graph[*parent_ref];
-                    if let Err(_) = parent_node.add_edge(ref_node) {
-                        // Edge already exists, we can continue
-                    }
+                    let parent_node = &mut graph[current_scope_ref];
+                    parent_node.add_edge(ref_node).ok();
 
                     let ref_node_mut = &mut graph[ref_node];
                     ref_node_mut
@@ -160,6 +152,13 @@ impl DataLineageTracker {
                         .attributes
                         .add(Identifier::from("scope"), Value::from(scope))
                         .ok();
+                    ref_node_mut
+                        .attributes
+                        .add(
+                            Identifier::from("position"),
+                            Value::from(format!("{},{}", start_pos.row + 1, start_pos.column + 1))
+                        )
+                        .ok();
                 }
             }
             _ => {}
@@ -168,7 +167,7 @@ impl DataLineageTracker {
         // Traverse children using simple iteration
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            self.traverse_tree(child, graph, parent_ref)?;
+            self.process_tree(child, graph, &current_scope_ref)?;
         }
 
         Ok(())
@@ -202,33 +201,131 @@ impl DataLineageTracker {
 
     pub fn get_full_lineage(&self, variable_name: &str) -> Vec<String> {
         let mut lineage = Vec::new();
-        if let Some(decl) = self.declarations.get(variable_name) {
-            lineage.push(format!("Declared in scope: {}", decl.scope));
-            for ref_ in &decl.references {
-                lineage.push(format!("Referenced in scope: {}", ref_.context));
+
+        // Find declaration node for the variable
+        for node_ref in self.graph.iter_nodes() {
+            let node = &self.graph[node_ref];
+            if let (Some(node_type), Some(name)) = (
+                node.attributes
+                    .get(&Identifier::from("type"))
+                    .map(|v| v.as_str().unwrap_or("")),
+                node.attributes
+                    .get(&Identifier::from("name"))
+                    .map(|v| v.as_str().unwrap_or("")),
+            ) {
+                if node_type == "declaration" && name == variable_name {
+                    if let Some(scope) = node.attributes.get(&Identifier::from("scope")) {
+                        lineage.push(format!(
+                            "Declared in scope: {}",
+                            scope.as_str().unwrap_or("")
+                        ));
+                    }
+                }
             }
         }
+
+        // Find all references to the variable
+        for node_ref in self.graph.iter_nodes() {
+            let node = &self.graph[node_ref];
+            if let (Some(node_type), Some(name)) = (
+                node.attributes
+                    .get(&Identifier::from("type"))
+                    .map(|v| v.as_str().unwrap_or("")),
+                node.attributes
+                    .get(&Identifier::from("name"))
+                    .map(|v| v.as_str().unwrap_or("")),
+            ) {
+                if node_type == "reference" && name == variable_name {
+                    if let Some(scope) = node.attributes.get(&Identifier::from("scope")) {
+                        lineage.push(format!(
+                            "Referenced in scope: {}",
+                            scope.as_str().unwrap_or("")
+                        ));
+                    }
+                }
+            }
+        }
+
         lineage
     }
 
     pub fn print_lineage(&self) {
         println!("Variable Declarations and References:");
         println!("===================================");
-        for (name, declaration) in &self.declarations {
+
+        let mut declarations: HashMap<String, (String, Vec<(usize, usize, String)>)> =
+            HashMap::new();
+
+        // Find all declarations
+        for node_ref in self.graph.iter_nodes() {
+            let node = &self.graph[node_ref];
+            if let (Some(node_type), Some(name), Some(scope)) = (
+                node.attributes
+                    .get(&Identifier::from("type"))
+                    .map(|v| v.as_str().unwrap_or("")),
+                node.attributes
+                    .get(&Identifier::from("name"))
+                    .map(|v| v.as_str().unwrap_or("")),
+                node.attributes
+                    .get(&Identifier::from("scope"))
+                    .map(|v| v.as_str().unwrap_or("")),
+            ) {
+                if node_type == "declaration" {
+                    if let Some(pos) = node.attributes.get(&Identifier::from("position")) {
+                        let _pos_parts = pos
+                            .as_str()
+                            .unwrap_or("0,0")
+                            .split(',')
+                            .map(|s| s.parse::<usize>().unwrap_or(0))
+                            .collect::<Vec<_>>();
+                        declarations.insert(name.to_string(), (scope.to_string(), Vec::new()));
+                    }
+                }
+            }
+        }
+
+        // Find all references
+        for node_ref in self.graph.iter_nodes() {
+            let node = &self.graph[node_ref];
+            if let (Some(node_type), Some(name), Some(scope)) = (
+                node.attributes
+                    .get(&Identifier::from("type"))
+                    .map(|v| v.as_str().unwrap_or("")),
+                node.attributes
+                    .get(&Identifier::from("name"))
+                    .map(|v| v.as_str().unwrap_or("")),
+                node.attributes
+                    .get(&Identifier::from("scope"))
+                    .map(|v| v.as_str().unwrap_or("")),
+            ) {
+                if node_type == "reference" {
+                    if let Some(pos) = node.attributes.get(&Identifier::from("position")) {
+                        let start_pos = pos
+                            .as_str()
+                            .unwrap_or("0,0")
+                            .split(',')
+                            .map(|s| s.parse::<usize>().unwrap_or(0))
+                            .collect::<Vec<_>>();
+                        if let Some((_, refs)) = declarations.get_mut(name) {
+                            refs.push((start_pos[0], start_pos[1], scope.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Print the collected information
+        for (name, (scope, references)) in declarations {
             println!("\nVariable: {}", name);
-            println!(
-                " Declared at line {}, column {}",
-                declaration.location.line, declaration.location.column
-            );
-            println!(" Scope: {}", declaration.scope);
-            if declaration.references.is_empty() {
+            println!(" Declared in scope: {}", scope);
+            if references.is_empty() {
                 println!(" No references found");
             } else {
                 println!(" References:");
-                for reference in &declaration.references {
+                for (line, column, ref_scope) in references {
                     println!(
                         " - At line {}, column {} (in scope: {})",
-                        reference.location.line, reference.location.column, reference.context
+                        line, column, ref_scope
                     );
                 }
             }
