@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
-use tree_sitter_graph::graph::Graph;
-use tree_sitter_graph::ParseError;
+use tree_sitter_graph::graph::Value;
+use tree_sitter_graph::graph::{Graph, GraphNodeRef};
+use tree_sitter_graph::Identifier;
 
 #[derive(Debug, Clone)]
 struct Declaration {
@@ -41,50 +42,45 @@ impl DataLineageTracker {
     pub fn analyze_file<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Box<dyn Error>> {
         self.source_code = std::fs::read_to_string(path)?;
 
-        // Create a new parser
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(tree_sitter_javascript::language())
             .map_err(|e| Box::new(e) as Box<dyn Error>)?;
 
-        // Parse the source code
         let tree = parser
             .parse(&self.source_code, None)
             .ok_or("Failed to parse source code")?;
 
-        // Create a new graph
         let mut graph = Graph::new();
+        let root_node = graph.add_graph_node();
+        let root_node_mut = &mut graph[root_node];
+        root_node_mut
+            .attributes
+            .add(Identifier::from("type"), Value::from("root"))
+            .ok();
 
-        // Add the root node to the graph
-        let root_node = tree.root_node();
-        let _root_ref = graph.add_syntax_node(root_node);
+        // Start traversal with the root node
+        self.traverse_tree(tree.root_node(), &mut graph, &root_node)?;
 
-        // Create cursor for tree traversal
-        let mut cursor = root_node.walk();
-        self.traverse_tree(&mut cursor)?;
-
-        // We can use pretty_print for debugging
         println!("Generated Graph:");
         println!("{}", graph.pretty_print());
 
         Ok(())
     }
 
-    fn traverse_tree(
+    fn traverse_tree<'a>(
         &mut self,
-        cursor: &mut tree_sitter::TreeCursor,
+        node: tree_sitter::Node<'a>,
+        graph: &mut Graph<'a>,
+        parent_ref: &GraphNodeRef,
     ) -> Result<(), Box<dyn Error>> {
-        let node = cursor.node();
-
-        // Process current node
         match node.kind() {
             "variable_declarator" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     if let Ok(name) = name_node.utf8_text(self.source_code.as_bytes()) {
-                        // Determine scope first
                         let scope = self.determine_scope(&node);
-
-                        // Store the declaration
+                        
+                        // Store the declaration in the HashMap
                         let start_pos = name_node.start_position();
                         self.declarations.insert(
                             name.to_string(),
@@ -95,20 +91,42 @@ impl DataLineageTracker {
                                     column: start_pos.column + 1,
                                     length: name_node.end_byte() - name_node.start_byte(),
                                 },
-                                scope,
+                                scope: scope.clone(),
                                 references: Vec::new(),
                             },
                         );
+
+                        // Create graph nodes as before
+                        let _syntax_ref = graph.add_syntax_node(name_node);
+                        let decl_node = graph.add_graph_node();
+
+                        let parent_node = &mut graph[*parent_ref];
+                        if let Err(_) = parent_node.add_edge(decl_node) {
+                            // Edge already exists, we can continue
+                        }
+
+                        let decl_node_mut = &mut graph[decl_node];
+                        decl_node_mut
+                            .attributes
+                            .add(Identifier::from("type"), Value::from("declaration"))
+                            .ok();
+                        decl_node_mut
+                            .attributes
+                            .add(Identifier::from("name"), Value::from(name))
+                            .ok();
+                        decl_node_mut
+                            .attributes
+                            .add(Identifier::from("scope"), Value::from(scope))
+                            .ok();
                     }
                 }
             }
             "identifier" => {
                 if let Ok(name) = node.utf8_text(self.source_code.as_bytes()) {
-                    // Determine scope before mutable borrow
                     let scope = self.determine_scope(&node);
                     let start_pos = node.start_position();
 
-                    // Now do the mutable borrow
+                    // Update references in the HashMap
                     if let Some(decl) = self.declarations.get_mut(&name.to_string()) {
                         decl.references.push(Reference {
                             location: Location {
@@ -116,23 +134,41 @@ impl DataLineageTracker {
                                 column: start_pos.column + 1,
                                 length: node.end_byte() - node.start_byte(),
                             },
-                            context: scope,
+                            context: scope.clone(),
                         });
                     }
+
+                    // Create graph nodes as before
+                    let _syntax_ref = graph.add_syntax_node(node);
+                    let ref_node = graph.add_graph_node();
+
+                    let parent_node = &mut graph[*parent_ref];
+                    if let Err(_) = parent_node.add_edge(ref_node) {
+                        // Edge already exists, we can continue
+                    }
+
+                    let ref_node_mut = &mut graph[ref_node];
+                    ref_node_mut
+                        .attributes
+                        .add(Identifier::from("type"), Value::from("reference"))
+                        .ok();
+                    ref_node_mut
+                        .attributes
+                        .add(Identifier::from("name"), Value::from(name))
+                        .ok();
+                    ref_node_mut
+                        .attributes
+                        .add(Identifier::from("scope"), Value::from(scope))
+                        .ok();
                 }
             }
             _ => {}
         }
 
-        // Traverse children
-        if cursor.goto_first_child() {
-            loop {
-                self.traverse_tree(cursor)?;
-                if !cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-            cursor.goto_parent();
+        // Traverse children using simple iteration
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.traverse_tree(child, graph, parent_ref)?;
         }
 
         Ok(())
