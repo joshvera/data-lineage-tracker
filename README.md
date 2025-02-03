@@ -51,6 +51,14 @@ function outer() {
     }
     return inner() + outerVar;
 }
+class Example {
+    constructor() {
+        this.classVar = globalVar;
+    }
+    method() {
+        return this.classVar + globalVar;
+    }
+}
 ' > test.js
 ```
 
